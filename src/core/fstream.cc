@@ -24,6 +24,7 @@
 #include <fmt/ostream.h>
 #include <malloc.h>
 #include <string.h>
+#include <fcntl.h>
 #include <ratio>
 #include <optional>
 #include <utility>
@@ -36,6 +37,9 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/io_intent.hh>
+#include "core/syscall_result.hh"
+#include "core/thread_pool.hh"
+#include <seastar/util/internal/iovec_utils.hh>
 
 namespace seastar {
 
@@ -520,6 +524,116 @@ future<output_stream<char>> make_file_output_stream(file f, file_output_stream_o
     return make_file_data_sink(std::move(f), options).then([] (data_sink&& ds) {
         return output_stream<char>(std::move(ds));
     });
+}
+
+/*
+ * Character-device / pipe stream implementations.
+ *
+ * I/O is dispatched through the reactor's thread pool: blocking
+ * read(2)/write(2) calls run on a dedicated worker thread so the reactor
+ * loop is never stalled.  This makes the streams suitable for any fd that
+ * supports plain sequential I/O — character devices, PTYs, named FIFOs,
+ * anonymous pipes, and even regular files (whose fds cannot be registered
+ * with epoll/io_uring POLL).
+ */
+
+class chardev_data_source_impl : public data_source_impl {
+    file_desc _fd;
+    const size_t _buf_size;
+public:
+    chardev_data_source_impl(file_desc fd, size_t buf_size)
+            : _fd(std::move(fd)), _buf_size(buf_size) {}
+
+    future<temporary_buffer<char>> get() override {
+        auto buf = temporary_buffer<char>(_buf_size);
+        auto* ptr = buf.get_write();
+        auto len = buf.size();
+        auto sr = co_await engine()._thread_pool->submit<syscall_result<ssize_t>>(
+                internal::thread_pool_submit_reason::file_operation, [fd = _fd.get(), ptr, len] {
+            return wrap_syscall<ssize_t>(::read(fd, ptr, len));
+        });
+        sr.throw_if_error();
+        buf.trim(static_cast<size_t>(sr.result));
+        co_return std::move(buf);
+    }
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+
+    // Used by the path-based factory to open the device asynchronously.
+    static future<file_desc> open(sstring path, int flags) {
+        auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+                internal::thread_pool_submit_reason::file_operation, [path, flags] {
+            return wrap_syscall<int>(::open(path.c_str(), flags | O_CLOEXEC));
+        });
+        sr.throw_if_error();
+        co_return file_desc::from_fd(sr.result);
+    }
+};
+
+class chardev_data_sink_impl : public data_sink_impl {
+    file_desc _fd;
+    const size_t _buf_size;
+public:
+    chardev_data_sink_impl(file_desc fd, size_t buf_size)
+            : _fd(std::move(fd)), _buf_size(buf_size) {}
+
+    // Writes are dispatched to the reactor's thread pool so that
+    // blocking write(2) calls never stall the reactor loop.  This
+    // approach works for all fd types including regular files (which
+    // cannot be polled with epoll/io_uring POLLOUT).
+    future<> put(std::span<temporary_buffer<char>> bufs) override {
+        // Chain all buffer deleters into one before the first co_await so the
+        // underlying memory stays alive for the duration of the write.
+        deleter del;
+        std::vector<iovec> iov;
+        iov.reserve(bufs.size());
+        for (auto& b : bufs) {
+            iov.push_back({const_cast<char*>(b.get()), b.size()});
+            deleter d = b.release();
+            d.append(std::move(del));
+            del = std::move(d);
+        }
+        auto remaining = std::span<iovec>(iov);
+        while (!remaining.empty()) {
+            auto sr = co_await engine()._thread_pool->submit<syscall_result<ssize_t>>(
+                    internal::thread_pool_submit_reason::file_operation,
+                    [fd = _fd.get(), data = remaining.data(), cnt = remaining.size()] {
+                return wrap_syscall<ssize_t>(::writev(fd, data, cnt));
+            });
+            sr.throw_if_error();
+            remaining = internal::iovec_trim_front(remaining, static_cast<size_t>(sr.result));
+        }
+    }
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+
+    size_t buffer_size() const noexcept override { return _buf_size; }
+};
+
+input_stream<char> make_chardev_input_stream(file_desc fd, size_t buffer_size) {
+    return input_stream<char>(data_source(
+            std::make_unique<chardev_data_source_impl>(std::move(fd), buffer_size)));
+}
+
+output_stream<char> make_chardev_output_stream(file_desc fd, size_t buffer_size) {
+    return output_stream<char>(data_sink(
+            std::make_unique<chardev_data_sink_impl>(std::move(fd), buffer_size)));
+}
+
+future<input_stream<char>> make_chardev_input_stream(std::string_view path, size_t buffer_size) {
+    auto fd = co_await chardev_data_source_impl::open(sstring(path), O_RDONLY);
+    co_return make_chardev_input_stream(std::move(fd), buffer_size);
+}
+
+future<output_stream<char>> make_chardev_output_stream(std::string_view path, size_t buffer_size) {
+    auto fd = co_await chardev_data_source_impl::open(sstring(path), O_WRONLY);
+    co_return make_chardev_output_stream(std::move(fd), buffer_size);
 }
 
 /*

@@ -30,11 +30,14 @@
 // interface to files, while retaining the zero-copy characteristics of
 // seastar files.
 #include <seastar/core/file.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/posix.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/internal/api-level.hh>
 
 #include <cstdint>
+#include <string_view>
 
 namespace seastar {
 
@@ -128,6 +131,41 @@ future<output_stream<char>> make_file_output_stream(
 /// newly created file.
 /// Closes the file if the sink creation fails.
 future<data_sink> make_file_data_sink(file, file_output_stream_options) noexcept;
+
+/// \defgroup chardev-streams Character-device / pipe streams
+///
+/// These factories create byte streams backed by a character device or pipe.
+/// I/O is performed sequentially via the thread pool, making them suitable
+/// for PTYs, named FIFOs, anonymous pipes, and any other fd that supports
+/// plain read(2)/write(2) but not seekable or O_DIRECT I/O.
+///
+/// Two construction modes are available:
+///  - From a \c file_desc (takes ownership of the fd).
+///  - From a filesystem path (opens the file asynchronously via the thread
+///    pool without O_DIRECT).
+/// @{
+
+/// Create an input_stream that reads from a character device or pipe fd.
+/// The stream takes ownership of \p fd.  Blocking read(2) calls are
+/// dispatched to the reactor's thread pool so the reactor loop is never
+/// stalled.
+input_stream<char> make_chardev_input_stream(file_desc fd, size_t buffer_size = 8192);
+
+/// Create an output_stream that writes to a character device or pipe fd.
+/// The stream takes ownership of \p fd.  Blocking write(2) calls are
+/// dispatched to the reactor's thread pool so the reactor loop is never
+/// stalled.
+output_stream<char> make_chardev_output_stream(file_desc fd, size_t buffer_size = 8192);
+
+/// Asynchronously open a character device or regular file at \p path for
+/// reading and return an input_stream backed by it.
+future<input_stream<char>> make_chardev_input_stream(std::string_view path, size_t buffer_size = 8192);
+
+/// Asynchronously open a character device or regular file at \p path for
+/// writing and return an output_stream backed by it.
+future<output_stream<char>> make_chardev_output_stream(std::string_view path, size_t buffer_size = 8192);
+
+/// @}
 
 
 }
